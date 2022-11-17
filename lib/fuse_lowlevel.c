@@ -398,6 +398,8 @@ static void fill_open(struct fuse_open_out *arg,
 		arg->open_flags |= FOPEN_NONSEEKABLE;
 	if (f->noflush)
 		arg->open_flags |= FOPEN_NOFLUSH;
+	if (f->file_created)
+		arg->open_flags |= FOPEN_FILE_CREATED;
 }
 
 int fuse_reply_entry(fuse_req_t req, const struct fuse_entry_param *e)
@@ -1331,6 +1333,28 @@ static void do_open(fuse_req_t req, fuse_ino_t nodeid, const void *inarg)
 		req->se->op.open(req, nodeid, &fi);
 	else
 		fuse_reply_open(req, &fi);
+}
+
+static void do_open_atomic(fuse_req_t req, fuse_ino_t nodeid, const void *inarg)
+{
+	struct fuse_create_in *arg = (struct fuse_create_in *) inarg;
+
+	if (req->se->op.open_atomic) {
+		struct fuse_file_info fi;
+		char *name = PARAM(arg);
+
+		memset(&fi, 0, sizeof(fi));
+		fi.flags = arg->flags;
+
+		if (req->se->conn.proto_minor >= 12)
+			req->ctx.umask = arg->umask;
+		else
+			name = (char *) inarg + sizeof(struct fuse_open_in);
+
+		req->se->op.open_atomic(req, nodeid, name, arg->mode, &fi);
+
+	} else
+		fuse_reply_err(req, ENOSYS);
 }
 
 static void do_read(fuse_req_t req, fuse_ino_t nodeid, const void *inarg)
@@ -2526,6 +2550,7 @@ static struct {
 	[FUSE_RENAME2]     = { do_rename2,      "RENAME2"    },
 	[FUSE_COPY_FILE_RANGE] = { do_copy_file_range, "COPY_FILE_RANGE" },
 	[FUSE_LSEEK]	   = { do_lseek,       "LSEEK"	     },
+	[FUSE_OPEN_ATOMIC] = { do_open_atomic, "OPEN_ATOMIC" },
 	[CUSE_INIT]	   = { cuse_lowlevel_init, "CUSE_INIT"   },
 };
 

@@ -1245,6 +1245,54 @@ struct fuse_lowlevel_ops {
 	 */
 	void (*lseek) (fuse_req_t req, fuse_ino_t ino, off_t off, int whence,
 		       struct fuse_file_info *fi);
+	/**
+	 * Lookup + create + Open a file
+	 *
+	 * There are two cases to be handled here:
+	 *
+	 * a) File does not exist
+	 * O_CREAT || (O_CREAT | O_EXCL):
+	 * - Create file with specified mode
+	 * - Set `file_created` bit in `struct fuse_file_info`
+	 * - Open the file
+	 * - Fill in the attributes
+	 *
+	 * ~O_CREAT:
+	 * - ENOENT
+	 *
+	 * b) File exist already
+	 * O_CREAT || ~O_CREAT:
+	 * - Open the file
+	 * - Fill in the attributes.
+	 *
+	 * O_CREAT | O_EXCL:
+	 * - EEXIST
+	 *
+	 * If file is newly created then set `file_created` bit in
+	 * `struct fuse_file_info`. This bit is used by libfuse to
+	 * convey same info to the fuse kernel.
+	 *
+	 * If this function is implemented, we avoids unnecessary lookups
+	 * from fuse kernel into libfuse which are otherwise triggered
+	 * before open/create. With this implementation, we combine
+	 * lookup + create + open into single call.
+	 *
+	 * If this func is not implemented then behaviour remains same i.e fuse
+	 * kernel would trigger lookups before open/create.
+	 *
+	 * Valid replies:
+	 *	fuse_reply_open_atomic
+	 *	fuse_reply_err
+	 *
+	 * @param req request handle
+	 * @param parent inode number of the parent directory
+	 * @param name file to be created/opened
+	 * @param mode file type and mode with which to create the new file
+	 * @param fi file information
+	 */
+	void (*open_atomic) (fuse_req_t req, fuse_ino_t parent,
+			     const char *name, mode_t mode,
+			     struct fuse_file_info *fi);
 };
 
 /**

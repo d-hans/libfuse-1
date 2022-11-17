@@ -1771,6 +1771,31 @@ int fuse_fs_open(struct fuse_fs *fs, const char *path,
 	}
 }
 
+int fuse_fs_open_atomic(struct fuse_fs *fs, const char *path, mode_t mode,
+			struct stat *buf, struct fuse_file_info *fi)
+{
+	fuse_get_context()->private_data = fs->user_data;
+	if (fs->op.open_atomic) {
+		int err;
+
+		if (fs->debug)
+			fuse_log(FUSE_LOG_DEBUG, "open_atomic flags: 0x%x %s\n", fi->flags,
+				 path);
+
+		err = fs->op.open_atomic(path, mode, buf, fi);
+
+		if (fs->debug && !err)
+			fuse_log(FUSE_LOG_DEBUG, "   open_atomic[%llu] flags: 0x%x "
+				 "getattr[%s] %s\n",
+				 (unsigned long long) fi->fh, fi->flags,
+				 file_info_string(fi, (char *)buf,
+				 sizeof(buf)), path);
+		return err;
+	} else {
+		return -ENOSYS;
+	}
+}
+
 static void fuse_free_buf(struct fuse_bufvec *buf)
 {
 	if (buf != NULL) {
@@ -2679,13 +2704,13 @@ static void fuse_lib_destroy(void *data)
 	f->fs = NULL;
 }
 
-static void fuse_lib_lookup(fuse_req_t req, fuse_ino_t parent,
-			    const char *name)
+static void fuse_do_get_node_dot_dotdot(fuse_req_t req, fuse_ino_t parent,
+					const char *name,
+					fuse_ino_t *ret_parent,
+					struct node **ret_dot)
 {
 	struct fuse *f = req_fuse_prepare(req);
 	struct fuse_entry_param e;
-	char *path;
-	int err;
 	struct node *dot = NULL;
 
 	if (name[0] == '.') {
@@ -2712,7 +2737,20 @@ static void fuse_lib_lookup(fuse_req_t req, fuse_ino_t parent,
 			name = NULL;
 		}
 	}
+	*ret_parent = parent;
+	*ret_dot = dot;
+}
 
+static void fuse_lib_lookup(fuse_req_t req, fuse_ino_t parent,
+			    const char *name)
+{
+	struct fuse *f = req_fuse_prepare(req);
+	struct fuse_entry_param e;
+	char *path;
+	int err;
+	struct node *dot = NULL;
+
+	fuse_do_get_node_dot_dotdot(req, parent, name, &parent, &dot);
 	err = get_path_name(f, parent, name, &path);
 	if (!err) {
 		struct fuse_intr_data d;
@@ -3289,6 +3327,68 @@ static void fuse_lib_open(fuse_req_t req, fuse_ino_t ino,
 		reply_err(req, err);
 
 	free_path(f, ino, path);
+}
+
+static void fuse_lib_open_atomic(fuse_req_t req, fuse_ino_t parent,
+				 const char *name, mode_t mode,
+				 struct fuse_file_info *fi)
+{
+	struct fuse *f = req_fuse_prepare(req);
+	struct fuse_intr_data d;
+	struct fuse_entry_param e;
+	char *path;
+	int err;
+	struct node *dot = NULL;
+
+	fuse_do_get_node_dot_dotdot(req, parent, name, &parent, &dot);
+	err = get_path_name(f, parent, name, &path);
+	if (!err) {
+		fuse_prepare_interrupt(f, req, &d);
+
+		err = fuse_fs_open_atomic(f->fs, path, mode, &e.attr, fi);
+		if (!err) {
+			err = do_lookup(f, parent, name, &e);
+			if (err == 0 && f->conf.debug) {
+				fuse_log(FUSE_LOG_DEBUG, "   NODEID: %llu\n",
+					 (unsigned long long) e.ino);
+			}
+		}
+		if (!err) {
+			if (S_ISREG(e.attr.st_mode)) {
+				if (f->conf.direct_io)
+					fi->direct_io = 1;
+				if (f->conf.kernel_cache)
+					fi->keep_cache = 1;
+				if (f->conf.auto_cache)
+					open_auto_cache(f, e.ino, path, fi);
+			}
+		} else if (err == -ENOENT && f->conf.negative_timeout != 0.0) {
+			e.ino = 0;
+			e.entry_timeout = f->conf.negative_timeout;
+			err = 0;
+		}
+		fuse_finish_interrupt(f, req, &d);
+	}
+	if (dot) {
+		pthread_mutex_lock(&f->lock);
+		unref_node(f, dot);
+		pthread_mutex_unlock(&f->lock);
+	}
+	if (!err) {
+		pthread_mutex_lock(&f->lock);
+		get_node(f, e.ino)->open_count++;
+		pthread_mutex_unlock(&f->lock);
+		if (fuse_reply_create(req, &e, fi) == -ENOENT) {
+			/* The atomic open syscall was interrupted, so it
+			 * must be cancelled.
+			 */
+			fuse_do_release(f, e.ino, path, fi);
+			forget_node(f, e.ino, 1);
+		}
+	} else {
+		reply_err(req, err);
+	}
+	free_path(f, parent, path);
 }
 
 static void fuse_lib_read(fuse_req_t req, fuse_ino_t ino, size_t size,
@@ -4478,6 +4578,7 @@ static struct fuse_lowlevel_ops fuse_path_ops = {
 	.link = fuse_lib_link,
 	.create = fuse_lib_create,
 	.open = fuse_lib_open,
+	.open_atomic = fuse_lib_open_atomic,
 	.read = fuse_lib_read,
 	.write_buf = fuse_lib_write_buf,
 	.flush = fuse_lib_flush,
