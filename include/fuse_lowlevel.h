@@ -1281,7 +1281,7 @@ struct fuse_lowlevel_ops {
 	 * kernel would trigger lookups before open/create.
 	 *
 	 * Valid replies:
-	 *	fuse_reply_open_atomic
+	 *	fuse_reply_create
 	 *	fuse_reply_err
 	 *
 	 * @param req request handle

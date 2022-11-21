@@ -784,6 +784,74 @@ static void lo_create(fuse_req_t req, fuse_ino_t parent, const char *name,
 		fuse_reply_create(req, &e, fi);
 }
 
+static bool lo_do_open(fuse_req_t req, fuse_ino_t ino,
+                       struct fuse_file_info *fi);
+static void lo_open_atomic(fuse_req_t req, fuse_ino_t parent, const char *name,
+			   mode_t mode, struct fuse_file_info *fi)
+{
+	struct lo_data *lo = lo_data(req);
+	struct fuse_entry_param e;
+	int err;
+	int fd;
+	bool success;
+
+	if (lo_debug(req))
+		fuse_log(FUSE_LOG_DEBUG, "lo_open_atomic(parent=%" PRIu64 ", name=%s)\n",
+			 parent, name);
+
+	err = lo_do_lookup(req, parent, name, &e);
+
+	/* Handle following cases
+	 *
+	 * File does not exist:
+	 * - O_CREAT: Create the file. Set `file_created` but in `fi`
+	 * - O_CREAT | O_EXCL: Create the file. Set `file_created` bit in `fi`
+	 * - ~O_CREAT:  Open the file
+	 *
+	 * File exist:
+	 * - O_CREAT: Open the file
+	 * - O_CREAT | O_EXCL: return EEXIST
+	 * - ~O_CREAT: Open the file
+	 */
+	if (err) {
+		if (err != ENOENT)
+			goto out;
+		else if (fi->flags & O_CREAT)
+			goto create;
+		else
+			goto out;
+	}
+	/* File exist. Try to open */
+open:
+	success = lo_do_open(req, e.ino, fi);
+	if (!success) {
+		err = errno;
+		/* Drop inode ref taken during lookup above */
+		unref_inode(lo, (struct lo_inode *)e.ino, 1);
+	}
+	goto out;
+
+create:
+	fd = openat(lo_fd(req, parent), name,
+		    fi->flags & ~O_NOFOLLOW, mode);
+	if (fd == -1) {
+		err = errno;
+		goto out;
+	}
+	close(fd);
+	fi->file_created = 1;
+	err = lo_do_lookup(req, parent, name, &e);
+	if (err)
+		goto out;
+	goto open;
+
+out:
+	if (err)
+		fuse_reply_err(req, err);
+	else
+		fuse_reply_create(req, &e, fi);
+}
+
 static void lo_fsyncdir(fuse_req_t req, fuse_ino_t ino, int datasync,
 			struct fuse_file_info *fi)
 {
@@ -797,15 +865,12 @@ static void lo_fsyncdir(fuse_req_t req, fuse_ino_t ino, int datasync,
 	fuse_reply_err(req, res == -1 ? errno : 0);
 }
 
-static void lo_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
+static bool lo_do_open(fuse_req_t req, fuse_ino_t ino,
+		       struct fuse_file_info *fi)
 {
 	int fd;
 	char buf[64];
 	struct lo_data *lo = lo_data(req);
-
-	if (lo_debug(req))
-		fuse_log(FUSE_LOG_DEBUG, "lo_open(ino=%" PRIu64 ", flags=%d)\n",
-			ino, fi->flags);
 
 	/* With writeback cache, kernel may send read requests even
 	   when userspace opened write-only */
@@ -826,14 +891,28 @@ static void lo_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 	sprintf(buf, "/proc/self/fd/%i", lo_fd(req, ino));
 	fd = open(buf, fi->flags & ~O_NOFOLLOW);
 	if (fd == -1)
-		return (void) fuse_reply_err(req, errno);
+		return false;
 
 	fi->fh = fd;
 	if (lo->cache == CACHE_NEVER)
 		fi->direct_io = 1;
 	else if (lo->cache == CACHE_ALWAYS)
 		fi->keep_cache = 1;
-	fuse_reply_open(req, fi);
+	return true;
+}
+
+static void lo_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
+{
+	if (lo_debug(req))
+		fuse_log(FUSE_LOG_DEBUG, "lo_open(ino=%" PRIu64 ", flags=%d)\n",
+			 ino, fi->flags);
+
+	bool success = lo_do_open(req, ino, fi);
+
+	if (success)
+		fuse_reply_open(req, fi);
+	else
+		fuse_reply_err(req, errno);
 }
 
 static void lo_release(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
@@ -1162,6 +1241,7 @@ static const struct fuse_lowlevel_ops lo_oper = {
 	.fsyncdir	= lo_fsyncdir,
 	.create		= lo_create,
 	.open		= lo_open,
+	.open_atomic	= lo_open_atomic,
 	.release	= lo_release,
 	.flush		= lo_flush,
 	.fsync		= lo_fsync,
